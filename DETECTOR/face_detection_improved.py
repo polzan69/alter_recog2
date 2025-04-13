@@ -15,6 +15,8 @@ import urllib.request
 import shutil
 import hashlib
 import math
+import requests
+import subprocess
 
 # Add at the top with other imports
 try:
@@ -22,7 +24,7 @@ try:
     NGROK_AVAILABLE = True
 except ImportError:
     NGROK_AVAILABLE = False
-    print("pyngrok not installed, remote access will not be available")
+    print("pyngrok not installed, ngrok remote access will not be available")
 
 # Create Flask and Socket.io app
 app = Flask(__name__)
@@ -69,6 +71,21 @@ dnn_detectors = {}
 if not os.path.exists('detected_faces'):
     os.makedirs('detected_faces')
 
+# External access configuration
+EXTERNAL_ACCESS_ENABLED = True  # Set to False to disable external access
+PORT = 5000
+EXTERNAL_ACCESS_MODE = 'localtunnel'  # 'port_forwarding', 'ngrok', or 'localtunnel'
+DDNS_HOSTNAME = None  # Set this to your DDNS hostname if you have one (e.g., 'mystream.duckdns.org')
+
+def get_external_ip():
+    """Get the external IP address of the machine"""
+    try:
+        external_ip = requests.get('https://api.ipify.org').text
+        return external_ip
+    except Exception as e:
+        print(f"Error getting external IP: {e}")
+        return None
+
 def get_local_ip():
     """Get the local IP address of the machine"""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -84,7 +101,7 @@ def get_local_ip():
 def register_service():
     """Register the face detection service using Zeroconf"""
     local_ip = get_local_ip()
-    port = 5000
+    port = PORT
     
     zeroconf = Zeroconf()
     service_info = ServiceInfo(
@@ -99,6 +116,183 @@ def register_service():
     print(f"Registering service on {local_ip}:{port}")
     zeroconf.register_service(service_info)
     return zeroconf, service_info
+
+def setup_external_access(port=PORT):
+    """Set up external access to the server using the specified method"""
+    if not EXTERNAL_ACCESS_ENABLED:
+        print("External access is disabled")
+        return None, None
+    
+    local_url = f"http://{get_local_ip()}:{port}"
+    external_url = None
+    access_message = None
+    
+    if EXTERNAL_ACCESS_MODE == 'port_forwarding':
+        external_ip = get_external_ip()
+        if external_ip:
+            if DDNS_HOSTNAME:
+                external_url = f"http://{DDNS_HOSTNAME}:{port}"
+                access_message = f"""
+                External access URL: {external_url}
+                
+                To use this URL, make sure:
+                1. Your router is configured to forward port {port} to {get_local_ip()}:{port}
+                2. Your DDNS client is properly updating {DDNS_HOSTNAME}
+                """
+            else:
+                external_url = f"http://{external_ip}:{port}"
+                access_message = f"""
+                External access URL: {external_url}
+                
+                To use this URL, make sure:
+                1. Your router is configured to forward port {port} to {get_local_ip()}:{port}
+                2. Consider setting up a DDNS service like DuckDNS, No-IP, or Dynu if your IP changes
+                """
+    
+    elif EXTERNAL_ACCESS_MODE == 'ngrok':
+        if NGROK_AVAILABLE:
+            external_url = setup_ngrok(port)
+            if external_url:
+                access_message = f"External access URL via ngrok: {external_url}"
+            else:
+                access_message = "Failed to set up ngrok for external access"
+        else:
+            access_message = "ngrok is not available. Install pyngrok package to use ngrok."
+    
+    elif EXTERNAL_ACCESS_MODE == 'localtunnel':
+        try:
+            # Try to use localtunnel daemon for more reliable external access
+            print("Setting up LocalTunnel daemon for external access...")
+            external_url = setup_localtunnel_daemon(port)
+            
+            if external_url:
+                access_message = f"""
+                External access URL via LocalTunnel: {external_url}
+                
+                This URL will remain valid as long as the LocalTunnel daemon is running.
+                If the URL stops working, restart the script or run the localtunnel_daemon
+                script located in the logs directory.
+                """
+            else:
+                # Fall back to one-time LocalTunnel setup
+                print("Daemon setup failed, trying direct LocalTunnel launch...")
+                import subprocess
+                
+                # Get the LocalTunnel executable path
+                lt_executable = find_lt_executable()
+                print(f"Using LocalTunnel executable: {lt_executable}")
+                
+                # Use the --print-url flag to get just the URL
+                print("Running LocalTunnel directly (this may take up to 30 seconds)...")
+                try:
+                    if lt_executable.startswith('"') and ('node' in lt_executable.lower()):
+                        # This is a direct node command, use as is with shell=True
+                        cmd = f"{lt_executable} --port {str(port)} --print-url"
+                        lt_info = subprocess.run(
+                            cmd, 
+                            shell=True,
+                            capture_output=True, 
+                            text=True, 
+                            timeout=30
+                        )
+                    elif lt_executable == "npx localtunnel":
+                        # Using npx fallback
+                        lt_info = subprocess.run(
+                            ["npx", "localtunnel", "--port", str(port), "--print-url"], 
+                            capture_output=True, 
+                            text=True, 
+                            timeout=30
+                        )
+                    else:
+                        # Try direct npx command as a more reliable option
+                        print("Trying direct npx localtunnel command...")
+                        lt_info = subprocess.run(
+                            ["npx", "localtunnel", "--port", str(port), "--print-url"], 
+                            capture_output=True, 
+                            text=True, 
+                            timeout=30
+                        )
+                        
+                        # If that fails, try the normal command file
+                        if lt_info.returncode != 0:
+                            print("Falling back to lt.cmd...")
+                            lt_info = subprocess.run(
+                                ["cmd", "/c", "call", lt_executable, "--port", str(port), "--print-url"], 
+                                capture_output=True, 
+                                text=True, 
+                                timeout=30
+                            )
+                
+                    if lt_info.returncode == 0 and lt_info.stdout.strip():
+                        external_url = lt_info.stdout.strip()
+                        # Save to log file for the status page to find
+                        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+                        if not os.path.exists(log_dir):
+                            os.makedirs(log_dir)
+                        log_file = os.path.join(log_dir, 'localtunnel.log')
+                        with open(log_file, 'w') as f:
+                            f.write(external_url)
+                        
+                        access_message = f"""
+                        External access URL via LocalTunnel: {external_url}
+                        
+                        Note: This URL might expire if the connection is interrupted.
+                        """
+                        print(f"LocalTunnel URL: {external_url}")
+                    else:
+                        print("LocalTunnel direct launch failed")
+                        stderr_output = lt_info.stderr
+                        print(f"Error output: {stderr_output}")
+                        print(f"Return code: {lt_info.returncode}")
+                        print(f"Output: {lt_info.stdout}")
+                        
+                        # Try one last approach - run lt without --print-url
+                        print("Trying LocalTunnel without --print-url flag...")
+                        try:
+                            lt_process = subprocess.Popen(
+                                ["npx", "localtunnel", "--port", str(port)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                text=True
+                            )
+                            
+                            # Monitor output for the URL
+                            for i in range(60):  # Try for up to 6 seconds
+                                output = lt_process.stdout.readline().strip()
+                                print(f"LocalTunnel output: {output}")
+                                if "your url is:" in output.lower():
+                                    external_url = output.split("your url is:")[1].strip()
+                                    print(f"Found URL: {external_url}")
+                                    
+                                    # Save to log file
+                                    with open(log_file, 'w') as f:
+                                        f.write(external_url)
+                                        
+                                    access_message = f"""
+                                    External access URL via LocalTunnel: {external_url}
+                                    
+                                    Note: This URL will remain valid as long as the process is running.
+                                    """
+                                    break
+                                time.sleep(0.1)
+                            
+                            # Don't terminate the process, let it run in the background
+                        except Exception as e:
+                            print(f"Error with alternative LocalTunnel approach: {e}")
+                            access_message = "Failed to start LocalTunnel"
+                except subprocess.TimeoutExpired:
+                    print("LocalTunnel command timed out after 30 seconds")
+                    access_message = "LocalTunnel timed out - network may be slow"
+                except Exception as e:
+                    print(f"Error setting up LocalTunnel: {e}")
+                    traceback.print_exc()
+                    access_message = f"Error with LocalTunnel: {str(e)}"
+        except Exception as e:
+            print(f"Error setting up LocalTunnel: {e}")
+            traceback.print_exc()
+            access_message = f"Error with LocalTunnel: {str(e)}"
+    
+    return external_url, access_message
 
 def init_feature_detectors():
     """Initialize feature detectors for facial features"""
@@ -528,6 +722,32 @@ def current_image():
 # Create a simple HTML page to display the video stream
 @app.route('/')
 def index():
+    external_ip = get_external_ip() if EXTERNAL_ACCESS_ENABLED else None
+    local_ip = get_local_ip()
+    external_access_url = None
+    
+    if EXTERNAL_ACCESS_ENABLED:
+        if DDNS_HOSTNAME:
+            external_access_url = f"http://{DDNS_HOSTNAME}:{PORT}"
+        elif external_ip:
+            external_access_url = f"http://{external_ip}:{PORT}"
+        elif EXTERNAL_ACCESS_MODE == 'localtunnel':
+            # Check if LocalTunnel is active
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+            log_file = os.path.join(log_dir, 'localtunnel.log')
+            if os.path.exists(log_file):
+                try:
+                    with open(log_file, 'r') as f:
+                        content = f.read().strip()
+                        if content:
+                            lines = content.split('\n')
+                            for line in lines:
+                                if line.startswith('http://') or line.startswith('https://'):
+                                    external_access_url = line
+                                    break
+                except Exception as e:
+                    print(f"Error reading LocalTunnel log: {e}")
+    
     html_template = '''
     <!DOCTYPE html>
     <html>
@@ -561,6 +781,41 @@ def index():
             max-width: 100%; 
             border: 1px solid #ddd;
             border-radius: 4px;
+          }
+          .access-info {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+            text-align: left;
+          }
+          .url-box {
+            padding: 8px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+            font-family: monospace;
+            margin: 5px 0;
+            word-break: break-all;
+          }
+          .localtunnel-info {
+            margin-top: 15px;
+            padding: 10px;
+            background-color: #e8f4fd;
+            border-radius: 5px;
+            border-left: 5px solid #007bff;
+          }
+          .btn {
+            display: inline-block;
+            padding: 8px 16px;
+            background-color: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            margin-top: 10px;
+            font-weight: bold;
+          }
+          .btn:hover {
+            background-color: #0069d9;
           }
         </style>
         <script>
@@ -597,12 +852,54 @@ def index():
           <div class="video-container">
             <img id="stream-img" src="{{ url_for('video_feed') }}" alt="Live Stream" />
           </div>
+          
+          {% if external_access_enabled %}
+          <div class="access-info">
+            <h3>Access Information</h3>
+            <p><strong>Local Network Access:</strong></p>
+            <div class="url-box">{{ local_url }}</div>
+            
+            {% if external_access_url and external_access_mode == 'localtunnel' %}
+            <div class="localtunnel-info">
+              <p><strong>External Access via LocalTunnel:</strong></p>
+              <div class="url-box">{{ external_access_url }}</div>
+              <p>Share this URL with anyone to allow them to view your camera stream.</p>
+              <p>If the URL stops working, check the LocalTunnel status:</p>
+              <a href="{{ url_for('localtunnel_status') }}" class="btn">Check LocalTunnel Status</a>
+            </div>
+            {% elif external_access_mode == 'localtunnel' and not external_access_url %}
+            <div class="localtunnel-info">
+              <p><strong>LocalTunnel Status:</strong> Not connected</p>
+              <p>The LocalTunnel service is not currently connected. Check the status page for reconnection instructions:</p>
+              <a href="{{ url_for('localtunnel_status') }}" class="btn">LocalTunnel Status & Setup</a>
+            </div>
+            {% elif external_access_url %}
+            <p><strong>External Access (requires port forwarding):</strong></p>
+            <div class="url-box">{{ external_access_url }}</div>
+            <p>To access from outside your network:</p>
+            <ol>
+              <li>Configure your router to forward port {{ port }} to {{ local_ip }}:{{ port }}</li>
+              {% if not ddns_hostname %}
+              <li>Consider setting up a DDNS service if your IP changes frequently</li>
+              {% endif %}
+            </ol>
+            {% endif %}
+          </div>
+          {% endif %}
+          
           <p>Connect to this stream from your mobile app</p>
         </div>
       </body>
     </html>
     '''
-    return render_template_string(html_template)
+    return render_template_string(html_template, 
+                                 local_url=f"http://{local_ip}:{PORT}",
+                                 external_access_url=external_access_url,
+                                 external_access_enabled=EXTERNAL_ACCESS_ENABLED,
+                                 external_access_mode=EXTERNAL_ACCESS_MODE,
+                                 local_ip=local_ip,
+                                 port=PORT,
+                                 ddns_hostname=DDNS_HOSTNAME)
 
 # Create a mobile-friendly page for embedding in WebView
 @app.route('/mobile_stream')
@@ -1282,9 +1579,6 @@ def setup_ngrok(port=5000):
         return None
         
     try:
-        # Set auth token
-        ngrok.set_auth_token("2jsIuWon6X9ZRwiBdHVKNG0pWp8_5qWA6iKMSirXGV9SG9SWQ")
-        
         # Open a ngrok tunnel to the HTTP server
         public_url = ngrok.connect(port, "http")
         print(f"Public URL: {public_url}")
@@ -1298,7 +1592,526 @@ def setup_ngrok(port=5000):
         print(f"Error setting up ngrok: {e}")
         traceback.print_exc()
         return None
+
+@app.route('/external_access_info')
+def external_access_info():
+    """Return information about how to access the stream externally"""
+    local_ip = get_local_ip()
+    external_ip = get_external_ip()
     
+    access_info = {
+        "local_url": f"http://{local_ip}:{PORT}",
+        "external_ip": external_ip,
+        "port": PORT,
+        "port_forward_url": f"http://{external_ip}:{PORT}" if external_ip else None,
+        "ddns_url": f"http://{DDNS_HOSTNAME}:{PORT}" if DDNS_HOSTNAME else None,
+        "router_config": "To access from outside your network, configure your router to forward port " + 
+                         f"{PORT} to your local IP {local_ip}:{PORT}",
+        "ddns_setup": "For a more permanent solution, consider setting up DDNS (Dynamic DNS) with services like DuckDNS, No-IP, or Dynu."
+    }
+    
+    return jsonify(access_info)
+
+def find_lt_executable():
+    """Find the full path to the LocalTunnel executable"""
+    try:
+        import subprocess
+        import os
+        import sys
+        
+        # Try to find lt in PATH first
+        if os.name == 'nt':  # Windows
+            # For Windows, we need to use lt.cmd, not lt
+            try:
+                # Check if lt.cmd is in PATH
+                process = subprocess.run(['where', 'lt.cmd'], capture_output=True, text=True)
+                if process.returncode == 0 and process.stdout.strip():
+                    return process.stdout.strip().split('\n')[0]
+            except:
+                pass
+                
+            # Check common locations for Windows
+            possible_paths = [
+                os.path.join(os.environ.get('APPDATA', ''), 'npm', 'lt.cmd'),
+                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'npm', 'lt.cmd'),
+                os.path.join(os.environ.get('PROGRAMFILES', ''), 'nodejs', 'node_modules', 'npm', 'bin', 'lt.cmd'),
+                os.path.join(os.environ.get('PROGRAMFILES(X86)', ''), 'nodejs', 'node_modules', 'npm', 'bin', 'lt.cmd')
+            ]
+            
+            # Try to get npm root
+            try:
+                npm_root_process = subprocess.run(['npm', 'root', '-g'], capture_output=True, text=True)
+                if npm_root_process.returncode == 0 and npm_root_process.stdout.strip():
+                    npm_root = npm_root_process.stdout.strip()
+                    possible_paths.append(os.path.join(os.path.dirname(npm_root), '.bin', 'lt.cmd'))
+                    possible_paths.append(os.path.join(npm_root, '.bin', 'lt.cmd'))
+                    possible_paths.append(os.path.join(npm_root, 'localtunnel', 'bin', 'lt.cmd'))
+            except:
+                pass
+
+            for path in possible_paths:
+                if os.path.exists(path):
+                    print(f"Found lt.cmd at: {path}")
+                    return path
+            
+            # If we get here, we're in trouble
+            print("WARNING: Could not find lt.cmd. Trying direct node approach...")
+            
+            # Try to find lt.js and run it with node directly
+            node_paths = [
+                os.path.join(os.environ.get('APPDATA', ''), 'npm', 'node_modules', 'localtunnel', 'bin', 'lt.js'),
+                os.path.join(npm_root if 'npm_root' in locals() else '', 'localtunnel', 'bin', 'lt.js')
+            ]
+            
+            node_exec = None
+            try:
+                node_process = subprocess.run(['where', 'node'], capture_output=True, text=True)
+                if node_process.returncode == 0 and node_process.stdout.strip():
+                    node_exec = node_process.stdout.strip().split('\n')[0]
+            except:
+                node_exec = r"C:\Program Files\nodejs\node.exe"
+            
+            if node_exec and os.path.exists(node_exec):
+                for node_path in node_paths:
+                    if os.path.exists(node_path):
+                        print(f"Found lt.js at {node_path}, will use with node")
+                        return f'"{node_exec}" "{node_path}"'
+            
+            # Last resort - try running npx
+            print("WARNING: Falling back to 'npx localtunnel'")
+            return "npx localtunnel"
+        else:
+            # For Unix-like systems
+            try:
+                process = subprocess.run(['which', 'lt'], capture_output=True, text=True)
+                if process.returncode == 0 and process.stdout.strip():
+                    return process.stdout.strip()
+            except:
+                pass
+            
+            # Return 'lt' and hope it's in PATH
+            return 'lt'
+    except Exception as e:
+        print(f"Error finding lt executable: {e}")
+        return 'lt'  # Default fallback
+
+def setup_localtunnel_daemon(port=5000):
+    """
+    Set up a LocalTunnel daemon process that keeps running even if main script exits.
+    Returns the URL if successful, None otherwise.
+    """
+    try:
+        print(f"Starting LocalTunnel daemon for port {port}...")
+        import subprocess
+        import os
+        import sys
+        import tempfile
+        
+        # Find the LocalTunnel executable
+        lt_executable = find_lt_executable()
+        print(f"Using LocalTunnel executable: {lt_executable}")
+        
+        # Create a log file for the daemon
+        log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        log_file = os.path.join(log_dir, 'localtunnel.log')
+        
+        # Create the start script (platform-specific)
+        if os.name == 'nt':  # Windows
+            script_ext = '.bat'
+            
+            # Check if lt_executable is a direct node command
+            if lt_executable.startswith('"') and ('node' in lt_executable.lower()):
+                # This is a node direct command, use as is
+                script_content = f"""@echo off
+echo Starting LocalTunnel daemon for port {port}...
+title LocalTunnel Daemon - Port {port}
+:loop
+echo [%date% %time%] Starting/Restarting LocalTunnel...
+{lt_executable} --port {port} --print-url > "{log_file}" 2>&1
+echo [%date% %time%] LocalTunnel exited, restarting in 5 seconds...
+timeout /t 5
+goto loop
+"""
+            elif lt_executable == "npx localtunnel":
+                # Using npx fallback
+                script_content = f"""@echo off
+echo Starting LocalTunnel daemon for port {port} using npx...
+title LocalTunnel Daemon - Port {port}
+:loop
+echo [%date% %time%] Starting/Restarting LocalTunnel...
+npx localtunnel --port {port} --print-url > "{log_file}" 2>&1
+echo [%date% %time%] LocalTunnel exited, restarting in 5 seconds...
+timeout /t 5
+goto loop
+"""
+            else:
+                # Normal .cmd file
+                script_content = f"""@echo off
+echo Starting LocalTunnel daemon for port {port}...
+title LocalTunnel Daemon - Port {port}
+:loop
+echo [%date% %time%] Starting/Restarting LocalTunnel...
+call "{lt_executable}" --port {port} --print-url > "{log_file}" 2>&1
+echo [%date% %time%] LocalTunnel exited, restarting in 5 seconds...
+timeout /t 5
+goto loop
+"""
+        else:  # Linux/Mac
+            script_ext = '.sh'
+            script_content = f"""#!/bin/bash
+echo "Starting LocalTunnel daemon for port {port}..."
+while true; do
+    "{lt_executable}" --port {port} --print-url > "{log_file}" 2>&1
+    echo "LocalTunnel exited, restarting in 5 seconds..."
+    sleep 5
+done
+"""
+        
+        # Create the script file
+        script_path = os.path.join(log_dir, f'localtunnel_daemon{script_ext}')
+        with open(script_path, 'w') as f:
+            f.write(script_content)
+        
+        # Make the script executable on Unix
+        if os.name != 'nt':
+            os.chmod(script_path, 0o755)
+            
+        # Now create the launcher script after script_path is defined
+        if os.name == 'nt':
+            launcher_content = f"""@echo off
+start "LocalTunnel Daemon" cmd /c "{script_path}"
+echo Started LocalTunnel daemon in a new window.
+"""
+            launcher_path = os.path.join(log_dir, f'launch_localtunnel{script_ext}')
+            with open(launcher_path, 'w') as f:
+                f.write(launcher_content)
+        
+        # Start the daemon process
+        if os.name == 'nt':  # Windows
+            # For Windows, it's more reliable to just run the script directly
+            # and not use the detached process flags which can cause issues
+            print(f"Starting LocalTunnel daemon script: {script_path}")
+            
+            # Start the process in a new window
+            startup_info = subprocess.STARTUPINFO()
+            startup_info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            # Just run the script directly
+            daemon = subprocess.Popen(
+                f'start cmd /c "{script_path}"',
+                shell=True
+            )
+            
+            # Also launch a simple direct localtunnel process to get the URL faster
+            print("Starting direct LocalTunnel process to get URL quickly...")
+            
+            if lt_executable.startswith('"') and ('node' in lt_executable.lower()):
+                # This is a direct node command, use as is with shell=True
+                cmd = f"{lt_executable} --port {str(port)} --print-url"
+                lt_proc = subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+            elif lt_executable == "npx localtunnel":
+                # Using npx fallback
+                lt_proc = subprocess.Popen(
+                    ["npx", "localtunnel", "--port", str(port), "--print-url"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+            else:
+                # Normal command file
+                lt_proc = subprocess.Popen(
+                    ["cmd", "/c", "call", lt_executable, "--port", str(port), "--print-url"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+            
+            # Wait a moment and read the output - increase timeout to 30 seconds
+            print("Waiting for LocalTunnel to initialize (up to 30 seconds)...")
+            time.sleep(5)  # Give it more initial time
+            try:
+                if lt_proc.poll() is None:  # Still running
+                    stdout_data, stderr_data = lt_proc.communicate(timeout=25)
+                    if stdout_data and ('http://' in stdout_data or 'https://' in stdout_data):
+                        url = stdout_data.strip()
+                        # Save to log file for the status page to find
+                        with open(log_file, 'w') as f:
+                            f.write(url)
+                        print(f"Got URL: {url}")
+                        return url
+                    else:
+                        print(f"LocalTunnel process completed but no URL found.")
+                        print(f"stdout: {stdout_data}")
+                        print(f"stderr: {stderr_data}")
+            except subprocess.TimeoutExpired:
+                print("LocalTunnel process is taking too long, but may still be working.")
+                # Don't kill the process, let it continue running
+        else:  # Linux/Mac
+            # Use nohup to keep the process running
+            daemon = subprocess.Popen(
+                ['nohup', script_path, '&'],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setpgrp
+            )
+        
+        # Wait a moment for LocalTunnel to start and write the URL to the log file
+        print("Waiting for LocalTunnel to initialize...")
+        url = None
+        for _ in range(10):  # Wait up to 10 seconds
+            time.sleep(1)
+            if os.path.exists(log_file):
+                with open(log_file, 'r') as f:
+                    content = f.read().strip()
+                    if content and ('http://' in content or 'https://' in content):
+                        url = content.split('\n')[0].strip()
+                        print(f"LocalTunnel URL: {url}")
+                        break
+        
+        if url:
+            print(f"LocalTunnel daemon started successfully with URL: {url}")
+            return url
+        else:
+            print("Failed to get LocalTunnel URL within timeout period")
+            return None
+            
+    except Exception as e:
+        print(f"Error setting up LocalTunnel daemon: {e}")
+        traceback.print_exc()
+        return None
+
+@app.route('/localtunnel_status')
+def localtunnel_status():
+    """Show the LocalTunnel status and provide reconnection instructions"""
+    if EXTERNAL_ACCESS_MODE != 'localtunnel':
+        return jsonify({
+            "status": "disabled",
+            "message": "LocalTunnel is not the configured external access method."
+        })
+    
+    # Check if the log file exists
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    log_file = os.path.join(log_dir, 'localtunnel.log')
+    
+    url = None
+    last_updated = None
+    status = "unknown"
+    
+    if os.path.exists(log_file):
+        try:
+            last_updated = datetime.fromtimestamp(os.path.getmtime(log_file))
+            with open(log_file, 'r') as f:
+                content = f.read().strip()
+                if content:
+                    lines = content.split('\n')
+                    for line in lines:
+                        if line.startswith('http://') or line.startswith('https://'):
+                            url = line
+                            status = "active"
+                            break
+        except Exception as e:
+            print(f"Error reading LocalTunnel log: {e}")
+    
+    # Get the script paths
+    daemon_script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
+                               'localtunnel_daemon.bat' if os.name == 'nt' else 'localtunnel_daemon.sh')
+    direct_script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'run_localtunnel.bat' if os.name == 'nt' else 'run_localtunnel.sh')
+    
+    daemon_script_exists = os.path.exists(daemon_script_path)
+    direct_script_exists = os.path.exists(direct_script_path)
+    
+    # Get the local IP and port
+    local_ip = get_local_ip()
+    local_url = f"http://{local_ip}:{PORT}"
+    
+    # Get process info (Windows only for now)
+    running_processes = []
+    if os.name == 'nt':
+        try:
+            import subprocess
+            process_info = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq lt.exe'], 
+                                        capture_output=True, text=True)
+            if 'lt.exe' in process_info.stdout:
+                running_processes.append('lt.exe')
+                
+            node_info = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq node.exe'], 
+                                     capture_output=True, text=True)
+            if 'node.exe' in node_info.stdout:
+                running_processes.append('node.exe')
+        except:
+            pass
+    
+    # Prepare the HTML response
+    html_template = '''
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>LocalTunnel Status</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+          body { 
+            font-family: Arial, sans-serif; 
+            margin: 0; 
+            padding: 20px; 
+            background-color: #f0f0f0;
+          }
+          h1, h2 { color: #333; }
+          .container { 
+            max-width: 800px; 
+            margin: 0 auto; 
+            background-color: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+          }
+          .url-box {
+            padding: 12px;
+            background-color: #e9ecef;
+            border-radius: 4px;
+            font-family: monospace;
+            margin: 10px 0;
+            word-break: break-all;
+          }
+          .status {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-weight: bold;
+            margin-right: 10px;
+          }
+          .active {
+            background-color: #d4edda;
+            color: #155724;
+          }
+          .inactive {
+            background-color: #f8d7da;
+            color: #721c24;
+          }
+          .unknown {
+            background-color: #fff3cd;
+            color: #856404;
+          }
+          .instruction {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-left: 5px solid #007bff;
+            margin: 15px 0;
+          }
+          .alert {
+            background-color: #fff3cd;
+            padding: 15px;
+            border-left: 5px solid #ffc107;
+            margin: 15px 0;
+          }
+          pre {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+          }
+          .btn {
+            display: inline-block;
+            padding: 8px 16px;
+            background-color: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+            margin-top: 10px;
+            font-weight: bold;
+          }
+          .btn:hover {
+            background-color: #0069d9;
+          }
+        </style>
+        <script>
+          // Auto-refresh every 30 seconds
+          setTimeout(function() {
+            window.location.reload();
+          }, 30000);
+        </script>
+      </head>
+      <body>
+        <div class="container">
+          <h1>LocalTunnel Status</h1>
+          
+          <h2>Current Status: 
+            <span class="status {{ 'active' if status == 'active' else 'inactive' if status == 'inactive' else 'unknown' }}">
+              {{ status.upper() }}
+            </span>
+          </h2>
+          
+          {% if url %}
+          <p><strong>External Access URL:</strong></p>
+          <div class="url-box">{{ url }}</div>
+          <p>Last updated: {{ last_updated }}</p>
+          <div class="alert">
+            <p><strong>Important:</strong> Share this URL with anyone you want to give access to your camera feed.</p>
+            <p>The URL will remain valid as long as the LocalTunnel process is running. If it stops working, you'll need to restart LocalTunnel.</p>
+          </div>
+          {% else %}
+          <p>No active LocalTunnel URL found.</p>
+          {% endif %}
+          
+          <h2>Local Access</h2>
+          <p>Your stream is always available locally at:</p>
+          <div class="url-box">{{ local_url }}</div>
+          
+          {% if not url %}
+          <h2>Start LocalTunnel</h2>
+          <div class="instruction">
+            <p>LocalTunnel is not connected. To start it:</p>
+            <ol>
+              <li>Open a new Command Prompt or Terminal window</li>
+              <li>Run the simplified LocalTunnel script:</li>
+              <pre>{{ direct_script_path }}</pre>
+              <li>Leave that window open while you want the stream to be accessible</li>
+              <li>Refresh this page after starting LocalTunnel</li>
+            </ol>
+          </div>
+          {% endif %}
+          
+          <h2>System Information</h2>
+          <ul>
+            <li>LocalTunnel log file: {{ log_file }}</li>
+            <li>Direct script exists: {{ direct_script_exists }}</li>
+            <li>Daemon script exists: {{ daemon_script_exists }}</li>
+            <li>Local IP: {{ local_ip }}</li>
+            <li>Port: {{ port }}</li>
+            {% if running_processes %}
+            <li>Running processes: {{ running_processes|join(', ') }}</li>
+            {% endif %}
+          </ul>
+          
+          <p><a href="/" class="btn">Back to main page</a></p>
+        </div>
+      </body>
+    </html>
+    '''
+    
+    return render_template_string(html_template,
+                                url=url,
+                                status="active" if url else "inactive",
+                                last_updated=last_updated,
+                                local_url=local_url,
+                                daemon_script_path=daemon_script_path,
+                                direct_script_path=direct_script_path,
+                                daemon_script_exists=daemon_script_exists,
+                                direct_script_exists=direct_script_exists,
+                                log_file=log_file,
+                                local_ip=local_ip,
+                                port=PORT,
+                                running_processes=running_processes)
+
 if __name__ == '__main__':
     # Initialize face detectors
     if not init_face_detectors():
@@ -1321,19 +2134,19 @@ if __name__ == '__main__':
     # Register service for discovery
     zeroconf_instance, service_info = register_service()
     
-    # Set up ngrok for public access (before starting the server)
-    public_url = None
-    if NGROK_AVAILABLE:
-        public_url = setup_ngrok(5000)
+    # Set up external access (before starting the server)
+    external_url, access_message = setup_external_access(PORT)
     
     try:
-        local_url = f"http://{get_local_ip()}:5000"
+        local_url = f"http://{get_local_ip()}:{PORT}"
         print(f"Server running locally at {local_url}")
-        if public_url:
-            print(f"Public access URL: {public_url}")
+        if external_url:
+            print(f"External access URL: {external_url}")
             print(f"Share this URL to access the camera feed from anywhere")
+        if access_message:
+            print(access_message)
         print("Press Ctrl+C to stop the server")
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+        socketio.run(app, host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
     except KeyboardInterrupt:
         print("Server stopped by user")
     except Exception as e:
@@ -1342,7 +2155,7 @@ if __name__ == '__main__':
         print("Shutting down...")
         stop_signal = True
         # Clean up ngrok tunnel
-        if NGROK_AVAILABLE:
+        if NGROK_AVAILABLE and EXTERNAL_ACCESS_MODE == 'ngrok':
             try:
                 ngrok.kill()
             except:

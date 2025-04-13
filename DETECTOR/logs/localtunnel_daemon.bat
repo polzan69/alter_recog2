@@ -1,0 +1,9 @@
+@echo off
+echo Starting LocalTunnel daemon for port 5000...
+title LocalTunnel Daemon - Port 5000
+:loop
+echo [%date% %time%] Starting/Restarting LocalTunnel...
+call "C:\Users\User\AppData\Roaming\npm\lt.cmd" --port 5000 --print-url > "d:\Repos\alter_recog2\DETECTOR\logs\localtunnel.log" 2>&1
+echo [%date% %time%] LocalTunnel exited, restarting in 5 seconds...
+timeout /t 5
+goto loop
