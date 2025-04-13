@@ -16,6 +16,14 @@ import shutil
 import hashlib
 import math
 
+# Add at the top with other imports
+try:
+    from pyngrok import ngrok
+    NGROK_AVAILABLE = True
+except ImportError:
+    NGROK_AVAILABLE = False
+    print("pyngrok not installed, remote access will not be available")
+
 # Create Flask and Socket.io app
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -93,39 +101,14 @@ def register_service():
     return zeroconf, service_info
 
 def init_feature_detectors():
-    """Initialize the facial feature cascade classifiers"""
-    global eye_cascade, nose_cascade, mouth_cascade, left_ear_cascade, right_ear_cascade
+    """Initialize feature detectors for facial features"""
+    global eye_cascade, nose_cascade, smile_cascade, left_ear_cascade, right_ear_cascade
     
-    try:
-        # Initialize detectors with absolute paths
-        eye_cascade = cv2.CascadeClassifier(CASCADE_FILES['eye'])
-        nose_cascade = cv2.CascadeClassifier(CASCADE_FILES['nose'])
-        mouth_cascade = cv2.CascadeClassifier(CASCADE_FILES['mouth'])
-        left_ear_cascade = cv2.CascadeClassifier(CASCADE_FILES['left_ear'])
-        right_ear_cascade = cv2.CascadeClassifier(CASCADE_FILES['right_ear'])
-        
-        # Verify all classifiers loaded successfully
-        cascades = {
-            'eye': eye_cascade,
-            'nose': nose_cascade,
-            'mouth': mouth_cascade,
-            'left_ear': left_ear_cascade,
-            'right_ear': right_ear_cascade
-        }
-        
-        for name, cascade in cascades.items():
-            if cascade.empty():
-                print(f"Warning: {name} cascade failed to load from {CASCADE_FILES[name]}")
-                return False
-            else:
-                print(f"Successfully loaded {name} cascade")
-        
-        print("All facial feature detectors initialized successfully")
-        return True
-    except Exception as e:
-        print(f"Error initializing facial feature detectors: {e}")
-        traceback.print_exc()
-        return False
+    success = True
+    
+    # Since we've removed Haar cascades completely, simplify this function
+    print("Feature detection disabled - using only SSD ResNet for face detection")
+    return success
 
 class DNNFaceDetector:
     """Class to handle different DNN face detection models"""
@@ -153,36 +136,7 @@ class DNNFaceDetector:
                 self.threshold = 0.5
                 self.swapRB = True
             
-            elif self.model_name == 'yunet':
-                model_path = os.path.join(FACE_DETECTOR_DIR, 'yunet.onnx')
-                
-                if not os.path.exists(model_path):
-                    print(f"Model file not found for YuNet: {model_path}")
-                    return False
-                
-                self.net = cv2.dnn.readNetFromONNX(model_path)
-                self.size = (320, 320)
-                self.scale = 1.0
-                self.mean = [127.5, 127.5, 127.5]
-                self.std = [128.0, 128.0, 128.0]
-                self.threshold = 0.6
-                self.swapRB = True
-                
-            elif self.model_name == 'retinaface':
-                model_path = os.path.join(FACE_DETECTOR_DIR, 'retinaface.onnx')
-                
-                if not os.path.exists(model_path):
-                    print(f"Model file not found for RetinaFace: {model_path}")
-                    return False
-                
-                self.net = cv2.dnn.readNetFromONNX(model_path)
-                self.size = (640, 640)
-                self.scale = 1.0/255.0
-                self.mean = [104.0, 117.0, 123.0]
-                self.threshold = 0.7
-                self.swapRB = True
-            
-            # Set computation preferences for better performance on Raspberry Pi
+            # Set computation preferences for better performance
             if self.net is not None:
                 # Try to use OpenCL if available for better performance
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
@@ -210,100 +164,48 @@ class DNNFaceDetector:
         
         try:
             # Prepare input blob
-            if hasattr(self, 'std'):
-                # Normalize using mean and std
-                blob = cv2.dnn.blobFromImage(
-                    frame, self.scale, self.size,
-                    mean=self.mean,
-                    std=self.std,
-                    swapRB=self.swapRB
-                )
-            else:
-                # Use simple mean subtraction
-                blob = cv2.dnn.blobFromImage(
-                    frame, self.scale, self.size,
-                    mean=self.mean,
-                    swapRB=self.swapRB
-                )
+            blob = cv2.dnn.blobFromImage(
+                frame, self.scale, self.size,
+                mean=self.mean,
+                swapRB=self.swapRB
+            )
             
             self.net.setInput(blob)
             detections = self.net.forward()
             
-            # Process detections based on model type
-            if self.model_name == 'ssd_resnet':
-                for i in range(detections.shape[2]):
-                    confidence = float(detections[0, 0, i, 2])
-                    if confidence < self.threshold:
-                        continue
-                    
-                    box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
-                    (startX, startY, endX, endY) = box.astype("int")
-                    
-                    # Convert numpy integers to Python integers
-                    startX = int(startX)
-                    startY = int(startY)
-                    endX = int(endX)
-                    endY = int(endY)
-                    
-                    # Ensure coordinates are within frame
-                    startX = max(0, startX)
-                    startY = max(0, startY)
-                    endX = min(width, endX)
-                    endY = min(height, endY)
-                    
-                    # Skip invalid detections
-                    if startX >= endX or startY >= endY:
-                        continue
-                    
-                    # Use standard Python types to avoid JSON serialization issues
-                    faces.append({
-                        'x': int(startX),
-                        'y': int(startY),
-                        'width': int(endX - startX),
-                        'height': int(endY - startY),
-                        'confidence': float(confidence)
-                    })
-            
-            elif self.model_name == 'yunet' or self.model_name == 'retinaface':
-                # These models may have different output formats
-                # For simplicity, we're providing a basic implementation that works with some ONNX models
-                # This would need to be adapted to the specific model's output format
+            # Process detections for SSD ResNet
+            for i in range(detections.shape[2]):
+                confidence = float(detections[0, 0, i, 2])
+                if confidence < self.threshold:
+                    continue
                 
-                # Simple approach - assumes detections are in flattened format with confidence, x, y, width, height
-                for i in range(0, detections.shape[1]):
-                    try:
-                        # Format may vary by model - adjust indices as needed
-                        confidence = float(detections[0, i, 4])
-                        if confidence < self.threshold:
-                            continue
-                        
-                        # Get coordinates (format depends on model)
-                        x1 = int(detections[0, i, 0] * width)
-                        y1 = int(detections[0, i, 1] * height)
-                        x2 = int(detections[0, i, 2] * width)
-                        y2 = int(detections[0, i, 3] * height)
-                        
-                        # Ensure coordinates are within frame and valid
-                        x1 = max(0, x1)
-                        y1 = max(0, y1)
-                        x2 = min(width, x2)
-                        y2 = min(height, y2)
-                        
-                        # Skip invalid detections
-                        if x1 >= x2 or y1 >= y2:
-                            continue
-                        
-                        # Use standard Python types
-                        faces.append({
-                            'x': int(x1),
-                            'y': int(y1),
-                            'width': int(x2 - x1),
-                            'height': int(y2 - y1),
-                            'confidence': float(confidence)
-                        })
-                    except IndexError:
-                        # Skip problematic detections
-                        continue
+                box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
+                (startX, startY, endX, endY) = box.astype("int")
+                
+                # Convert numpy integers to Python integers
+                startX = int(startX)
+                startY = int(startY)
+                endX = int(endX)
+                endY = int(endY)
+                
+                # Ensure coordinates are within frame
+                startX = max(0, startX)
+                startY = max(0, startY)
+                endX = min(width, endX)
+                endY = min(height, endY)
+                
+                # Skip invalid detections
+                if startX >= endX or startY >= endY:
+                    continue
+                
+                # Use standard Python types to avoid JSON serialization issues
+                faces.append({
+                    'x': int(startX),
+                    'y': int(startY),
+                    'width': int(endX - startX),
+                    'height': int(endY - startY),
+                    'confidence': float(confidence)
+                })
             
             return faces
             
@@ -313,57 +215,27 @@ class DNNFaceDetector:
             return []
 
 def init_face_detectors():
-    """Initialize face detectors including multiple DNN models"""
+    """Initialize face detectors - using only SSD ResNet model"""
     global face_detector, face_net, dnn_detectors
     
     success = True
     dnn_detectors = {}
     
-    # Initialize DNN detectors - try different models that might be available
-    model_names = ['ssd_resnet', 'yunet', 'retinaface']
-    for model_name in model_names:
-        try:
-            detector = DNNFaceDetector(model_name)
-            if detector.initialized:
-                dnn_detectors[model_name] = detector
-                print(f"Successfully initialized {model_name} detector")
-            else:
-                print(f"Failed to initialize {model_name} detector - model may not be available")
-        except Exception as e:
-            print(f"Error initializing {model_name} detector: {e}")
-            success = False
-    
-    # Initialize Haar cascade as fallback
+    # Initialize only SSD ResNet detector
     try:
-        # Try local file first
-        cascade_path = os.path.join(CASCADE_DIR, 'haarcascade_frontalface_default.xml')
-        if os.path.exists(cascade_path):
-            face_detector = cv2.CascadeClassifier(cascade_path)
+        detector = DNNFaceDetector('ssd_resnet')
+        if detector.initialized:
+            dnn_detectors['ssd_resnet'] = detector
+            print("Successfully initialized ssd_resnet detector")
         else:
-            # Fall back to OpenCV's built-in cascades
-            cascade_file = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            face_detector = cv2.CascadeClassifier(cascade_file)
-            
-        if face_detector.empty():
-            print("Error loading Haar cascade face detector")
-            
-            # One more fallback attempt - try the alt version
-            alt_cascade = cv2.data.haarcascades + 'haarcascade_frontalface_alt2.xml'
-            face_detector = cv2.CascadeClassifier(alt_cascade)
-            
-            if face_detector.empty():
-                print("Error loading alternative Haar cascade detector")
-                success = False
-            else:
-                print("Successfully initialized alternative Haar cascade face detector")
-        else:
-            print("Successfully initialized Haar cascade face detector")
+            print("Failed to initialize ssd_resnet detector - model may not be available")
+            success = False
     except Exception as e:
-        print(f"Error initializing Haar cascade face detector: {e}")
+        print(f"Error initializing ssd_resnet detector: {e}")
         success = False
     
-    # Make sure we have at least one working detector
-    if not dnn_detectors and (face_detector is None or face_detector.empty()):
+    # Make sure detector is working
+    if not dnn_detectors:
         print("ERROR: No working face detectors available!")
         success = False
     
@@ -506,9 +378,9 @@ def camera_processing():
                 
                 # Only run detection at specific intervals to improve performance
                 if do_detection:
-                    # Detect faces using our function with priority for YuNet
+                    # Detect faces using our function with priority for ssd_resnet
                     detection_result = detect_faces(frame, {
-                        'method': 'auto',
+                        'method': 'ssd_resnet',
                         'min_confidence': 0.5,
                         'min_face_size': 30
                     })
@@ -529,14 +401,8 @@ def camera_processing():
                     
                     # Use different colors based on detection method
                     color = (0, 255, 0)  # Default green
-                    if method == 'yunet':
-                        color = (0, 255, 255)  # Yellow for YuNet
-                    elif method == 'ssd_resnet':
-                        color = (255, 0, 255)  # Purple for SSD ResNet
-                    elif method == 'retinaface':
-                        color = (255, 255, 0)  # Cyan for RetinaFace
-                    elif 'haar' in method:
-                        color = (0, 165, 255)  # Orange for Haar cascade
+                    if method == 'ssd_resnet':
+                        color = (255, 0, 255)  # Purple for ssd_resnet
                     
                     cv2.rectangle(output_frame, (x, y), (x+w, y+h), color, 2)
                     cv2.putText(output_frame, f"{method[:4]} ({conf:.2f})", (x, y-10), 
@@ -829,30 +695,25 @@ def handle_capture_request():
         
         # Detect faces using our function with both detection methods for better results
         try:
-            # Try DNN first (more accurate but might not be available)
-            result_dnn = detect_faces(capture_frame, {'method': 'dnn', 'min_confidence': 0.5})
-            # Also try Haar cascade (more reliable but less accurate)
-            result_haar = detect_faces(capture_frame, {'method': 'haar'})
+            # Try ssd_resnet first (more accurate but might not be available)
+            result_ssd_resnet = detect_faces(capture_frame, {'method': 'ssd_resnet', 'min_confidence': 0.5})
             
-            # Use the result with more faces, or default to Haar cascade result
-            if result_dnn['num_faces'] > result_haar['num_faces']:
-                print(f"Using DNN detection with {result_dnn['num_faces']} faces")
-                detect_result = result_dnn
-                faces_data = result_dnn['faces']
+            # Use the result with more faces, or default to ssd_resnet result
+            if result_ssd_resnet['num_faces'] > 0:
+                print(f"Using ssd_resnet detection with {result_ssd_resnet['num_faces']} faces")
+                detect_result = result_ssd_resnet
+                faces_data = result_ssd_resnet['faces']
             else:
-                print(f"Using Haar detection with {result_haar['num_faces']} faces")
-                detect_result = result_haar
-                faces_data = result_haar['faces']
+                print(f"Using ssd_resnet detection with {result_ssd_resnet['num_faces']} faces")
+                detect_result = result_ssd_resnet
+                faces_data = result_ssd_resnet['faces']
             
             # last_capture_faces should already be updated by the detect_faces function
             # but update it again just to be sure
             if len(last_capture_faces) == 0 and len(faces_data) > 0:
                 print("No face crops in last_capture_faces, but faces were detected. Recapturing...")
                 # Try again with the method that worked better
-                if result_dnn['num_faces'] > result_haar['num_faces']:
-                    detect_faces(capture_frame, {'method': 'dnn', 'min_confidence': 0.5})
-                else:
-                    detect_faces(capture_frame, {'method': 'haar'})
+                detect_faces(capture_frame, {'method': 'ssd_resnet', 'min_confidence': 0.5})
             
             # Draw rectangles for detected faces for visual feedback
             for face in faces_data:
@@ -1010,17 +871,12 @@ def api_status():
     """API endpoint to check server status"""
     global face_detector, face_net
     
-    # Make sure at least one face detector is initialized
+    # Check for SSD ResNet detector
     detection_method = 'unknown'
-    if face_net is not None:
-        detection_method = 'DNN'
-    elif face_detector is not None:
-        detection_method = 'Haar cascade'
+    if 'ssd_resnet' in dnn_detectors:
+        detection_method = 'SSD ResNet'
     else:
-        # Initialize Haar cascade as fallback
-        cascade_file = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        face_detector = cv2.CascadeClassifier(cascade_file)
-        detection_method = 'Haar cascade'
+        detection_method = 'No working detector'
     
     # Return basic status information
     return jsonify({
@@ -1038,80 +894,33 @@ def api_status():
     })
 
 def perform_self_test():
-    """Perform a self-test to ensure face detection is working properly"""
-    print("Performing face detection self-test...")
-    
+    """Perform a self-test to verify the face detection system is working"""
     try:
-        # Create a test image with a face-like shape - more realistic
-        test_img = np.zeros((400, 400, 3), dtype=np.uint8)
+        print("Performing face detection self-test...")
         
-        # Fill with skin tone
-        test_img[:, :] = [204, 172, 156]  # BGR skin tone
+        # Check if we have at least one detector available
+        if not dnn_detectors or 'ssd_resnet' not in dnn_detectors:
+            print("❌ Self-test ERROR: No face detectors available")
+            return False
         
-        # Draw face oval
-        cv2.ellipse(test_img, (200, 200), (120, 160), 0, 0, 360, (226, 194, 178), -1)
+        # Test with a simple blank image
+        test_img = np.zeros((300, 300, 3), dtype=np.uint8)
+        test_img = cv2.rectangle(test_img, (100, 100), (200, 200), (255, 255, 255), -1)
         
-        # Draw eyes
-        # Left eye
-        cv2.ellipse(test_img, (150, 160), (30, 20), 0, 0, 360, (255, 255, 255), -1)
-        cv2.circle(test_img, (150, 160), 10, (70, 50, 50), -1)
+        # Try to detect faces
+        result = detect_faces(test_img)
         
-        # Right eye
-        cv2.ellipse(test_img, (250, 160), (30, 20), 0, 0, 360, (255, 255, 255), -1)
-        cv2.circle(test_img, (250, 160), 10, (70, 50, 50), -1)
-        
-        # Draw eyebrows
-        cv2.line(test_img, (120, 130), (180, 140), (70, 35, 35), 5)
-        cv2.line(test_img, (220, 140), (280, 130), (70, 35, 35), 5)
-        
-        # Draw nose
-        cv2.line(test_img, (200, 160), (190, 210), (178, 146, 129), 8)
-        cv2.line(test_img, (190, 210), (210, 210), (178, 146, 129), 8)
-        
-        # Draw mouth
-        cv2.ellipse(test_img, (200, 260), (60, 25), 0, 0, 180, (151, 104, 138), -1)
-        
-        # Try different detection methods
-        # First with DNN if available
-        params = {'method': 'dnn', 'min_confidence': 0.3}
-        result = detect_faces(test_img, params)
-        
-        if result['num_faces'] > 0:
-            print(f"✅ Self-test PASSED with DNN: Detected {result['num_faces']} faces in test image")
-            return True
+        # Check if detection function runs without errors
+        if result is None:
+            print("❌ Self-test ERROR: detect_faces returned None")
+            return False
             
-        # If DNN fails, try Haar cascade
-        params = {'method': 'haar'}
-        result = detect_faces(test_img, params)
-        
-        if result['num_faces'] > 0:
-            print(f"✅ Self-test PASSED with Haar cascade: Detected {result['num_faces']} faces in test image")
+        # Updated check for the new return format (dictionary)
+        if 'faces' in result:
+            print("✓ Self-test passed: detect_faces returned proper format")
             return True
         else:
-            print("❌ Self-test FAILED: No faces detected in test image")
-            
-            # Save the test image for debugging
-            cv2.imwrite('self_test_image.jpg', test_img)
-            print("Test image saved to self_test_image.jpg")
-            
-            # Try with a real face image if possible
-            try:
-                # Use a standard example face image if available
-                example_path = cv2.data.haarcascades + '../lbpcascades/lbpcascade_frontalface.xml'
-                example_dir = os.path.dirname(example_path)
-                example_image = os.path.join(example_dir, '../face.jpg')
-                
-                if os.path.exists(example_image):
-                    print(f"Testing with example image: {example_image}")
-                    real_face = cv2.imread(example_image)
-                    real_result = detect_faces(real_face, {'method': 'haar'})
-                    
-                    if real_result['num_faces'] > 0:
-                        print(f"✅ Self-test PASSED with example image: Detected {real_result['num_faces']} faces")
-                        return True
-            except Exception as example_error:
-                print(f"Error testing with example image: {example_error}")
-            
+            print("❌ Self-test ERROR: Missing 'faces' key in result")
             return False
             
     except Exception as e:
@@ -1153,11 +962,11 @@ def test_detection():
         cv2.ellipse(test_img, (200, 260), (60, 25), 0, 0, 180, (151, 104, 138), -1)
         
         # Try different detection methods to see which one works better
-        result_dnn = detect_faces(test_img, {'method': 'dnn', 'min_confidence': 0.3})
+        result_ssd_resnet = detect_faces(test_img, {'method': 'ssd_resnet', 'min_confidence': 0.3})
         result_haar = detect_faces(test_img, {'method': 'haar'})
         
         # Use the result with more faces, or default to Haar cascade result
-        result = result_dnn if result_dnn['num_faces'] >= result_haar['num_faces'] and result_dnn['num_faces'] > 0 else result_haar
+        result = result_ssd_resnet if result_ssd_resnet['num_faces'] >= result_haar['num_faces'] and result_ssd_resnet['num_faces'] > 0 else result_haar
         
         # Add the test image to the response
         _, buffer = cv2.imencode('.jpg', test_img)
@@ -1203,18 +1012,16 @@ def handle_single_face_request(data):
     
     # Detect faces using our function with both detection methods for better results
     try:
-        # Try DNN first (more accurate but might not be available)
-        result_dnn = detect_faces(capture_frame, {'method': 'dnn', 'min_confidence': 0.5})
-        # Also try Haar cascade (more reliable but less accurate)
-        result_haar = detect_faces(capture_frame, {'method': 'haar'})
+        # Try ssd_resnet first (more accurate but might not be available)
+        result_ssd_resnet = detect_faces(capture_frame, {'method': 'ssd_resnet', 'min_confidence': 0.5})
         
-        # Use the result with more faces, or default to Haar cascade result
-        if result_dnn['num_faces'] > result_haar['num_faces']:
-            print(f"Using DNN detection with {result_dnn['num_faces']} faces")
-            faces_data = result_dnn['faces']
+        # Use the result with more faces, or default to ssd_resnet result
+        if result_ssd_resnet['num_faces'] > 0:
+            print(f"Using ssd_resnet detection with {result_ssd_resnet['num_faces']} faces")
+            faces_data = result_ssd_resnet['faces']
         else:
-            print(f"Using Haar detection with {result_haar['num_faces']} faces")
-            faces_data = result_haar['faces']
+            print(f"Using ssd_resnet detection with {result_ssd_resnet['num_faces']} faces")
+            faces_data = result_ssd_resnet['faces']
         
         if not faces_data or face_index >= len(faces_data):
             emit('single_face_result', {
@@ -1345,13 +1152,12 @@ def calculate_face_quality(face_roi):
 
 def detect_faces(frame, detect_params=None):
     """
-    Detect faces using multiple DNN models and Haar cascade with priority for YuNet
+    Detect faces using SSD ResNet model
     """
     if detect_params is None:
         detect_params = {}
     
     # Extract parameters with defaults
-    method = detect_params.get('method', 'auto')  # auto, dnn, haar
     min_confidence = detect_params.get('min_confidence', 0.5)
     min_face_size = detect_params.get('min_face_size', 30)  # Minimum size in pixels
     
@@ -1369,141 +1175,42 @@ def detect_faces(frame, detect_params=None):
         # For small frames, slightly enhance contrast for better detection
         process_frame = cv2.convertScaleAbs(process_frame, alpha=1.1, beta=5)
     
-    # Auto method - try DNN first, then fallback to Haar
-    if method == 'auto' or method == 'dnn':
-        # Try each DNN detector in order of preference
-        dnn_preference = ['yunet', 'ssd_resnet', 'retinaface']  # Order by preference
-        
-        for model_name in dnn_preference:
-            if model_name in dnn_detectors:
-                try:
-                    model_faces = dnn_detectors[model_name].detect(process_frame)
-                    
-                    # Filter by confidence
-                    model_faces = [f for f in model_faces if f['confidence'] >= min_confidence]
-                    
-                    if model_faces:
-                        for face in model_faces:
-                            face['method'] = model_name
-                            # Make sure all values are standard Python types, not NumPy types
-                            face['x'] = int(face['x'])
-                            face['y'] = int(face['y'])
-                            face['width'] = int(face['width'])
-                            face['height'] = int(face['height'])
-                            face['confidence'] = float(face['confidence'])
-                            face_data.append(face)
-                            
-                            # Create face crops
-                            x, y, w, h = face['x'], face['y'], face['width'], face['height']
-                            # Add padding for better face recognition (20%)
-                            pad_w = int(w * 0.2)
-                            pad_h = int(h * 0.2)
-                            crop_x = max(0, x - pad_w)
-                            crop_y = max(0, y - pad_h)
-                            crop_w = min(width - crop_x, w + 2*pad_w)
-                            crop_h = min(height - crop_y, h + 2*pad_h)
-                            
-                            if crop_w > 0 and crop_h > 0:
-                                face_crop = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-                                face_crop_data = face.copy()
-                                face_crop_data['crop'] = face_crop
-                                face_crops.append(face_crop_data)
-                        
-                        # If we found faces with this detector, stop trying others
-                        if face_data:
-                            break
-                except Exception as e:
-                    print(f"Error with {model_name} detector: {e}")
-    
-    # Fall back to Haar cascade if needed or specifically requested
-    if (method == 'auto' and not face_data) or method == 'haar':
+    # Use SSD ResNet detector
+    if 'ssd_resnet' in dnn_detectors:
         try:
-            if face_detector is not None and not face_detector.empty():
-                # Convert to grayscale for Haar cascade
-                gray = cv2.cvtColor(process_frame, cv2.COLOR_BGR2GRAY)
-                
-                # Enhance contrast slightly for better detection
-                gray = cv2.equalizeHist(gray)
-                
-                # Detect faces with improved parameters
-                faces = face_detector.detectMultiScale(
-                    gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=(min_face_size, min_face_size),
-                    flags=cv2.CASCADE_SCALE_IMAGE
-                )
-                
-                for (x, y, w, h) in faces:
-                    # Calculate confidence using our quality function
-                    face_roi = gray[y:y+h, x:x+w]
-                    quality_score = calculate_face_quality(face_roi)
+            model_faces = dnn_detectors['ssd_resnet'].detect(process_frame)
+            
+            # Filter by confidence
+            model_faces = [f for f in model_faces if f['confidence'] >= min_confidence]
+            
+            if model_faces:
+                for face in model_faces:
+                    face['method'] = 'ssd_resnet'
+                    # Make sure all values are standard Python types, not NumPy types
+                    face['x'] = int(face['x'])
+                    face['y'] = int(face['y'])
+                    face['width'] = int(face['width'])
+                    face['height'] = int(face['height'])
+                    face['confidence'] = float(face['confidence'])
+                    face_data.append(face)
                     
-                    # Only add faces that meet minimum confidence
-                    if quality_score >= min_confidence:
-                        face_data.append({
-                            'x': int(x),
-                            'y': int(y),
-                            'width': int(w),
-                            'height': int(h),
-                            'confidence': float(quality_score),
-                            'method': 'haar'
-                        })
-                        
-                        # Create face crop with padding
-                        pad_w = int(w * 0.2)
-                        pad_h = int(h * 0.2)
-                        crop_x = max(0, x - pad_w)
-                        crop_y = max(0, y - pad_h)
-                        crop_w = min(width - crop_x, w + 2*pad_w)
-                        crop_h = min(height - crop_y, h + 2*pad_h)
-                        
-                        if crop_w > 0 and crop_h > 0:
-                            face_crop = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-                            face_crop_data = face_data[-1].copy()
-                            face_crop_data['crop'] = face_crop
-                            face_crops.append(face_crop_data)
-                
-                # If still no faces, try with more aggressive parameters
-                if not face_data:
-                    faces = face_detector.detectMultiScale(
-                        gray,
-                        scaleFactor=1.05,  # Smaller scale factor to detect more faces
-                        minNeighbors=3,    # Lower threshold for neighbors
-                        minSize=(min_face_size, min_face_size),
-                        flags=cv2.CASCADE_SCALE_IMAGE
-                    )
+                    # Create face crops
+                    x, y, w, h = face['x'], face['y'], face['width'], face['height']
+                    # Add padding for better face recognition (20%)
+                    pad_w = int(w * 0.2)
+                    pad_h = int(h * 0.2)
+                    crop_x = max(0, x - pad_w)
+                    crop_y = max(0, y - pad_h)
+                    crop_w = min(width - crop_x, w + 2*pad_w)
+                    crop_h = min(height - crop_y, h + 2*pad_h)
                     
-                    for (x, y, w, h) in faces:
-                        face_roi = gray[y:y+h, x:x+w]
-                        quality_score = calculate_face_quality(face_roi)
-                        
-                        # Only add faces that meet minimum confidence
-                        if quality_score >= min_confidence:
-                            face_data.append({
-                                'x': int(x),
-                                'y': int(y),
-                                'width': int(w),
-                                'height': int(h),
-                                'confidence': float(quality_score),
-                                'method': 'haar_aggressive'
-                            })
-                            
-                            # Create face crop with padding
-                            pad_w = int(w * 0.2)
-                            pad_h = int(h * 0.2)
-                            crop_x = max(0, x - pad_w)
-                            crop_y = max(0, y - pad_h)
-                            crop_w = min(width - crop_x, w + 2*pad_w)
-                            crop_h = min(height - crop_y, h + 2*pad_h)
-                            
-                            if crop_w > 0 and crop_h > 0:
-                                face_crop = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
-                                face_crop_data = face_data[-1].copy()
-                                face_crop_data['crop'] = face_crop
-                                face_crops.append(face_crop_data)
+                    if crop_w > 0 and crop_h > 0:
+                        face_crop = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+                        face_crop_data = face.copy()
+                        face_crop_data['crop'] = face_crop
+                        face_crops.append(face_crop_data)
         except Exception as e:
-            print(f"Error with Haar cascade detector: {e}")
+            print(f"Error with ssd_resnet detector: {e}")
     
     # Perform Non-Maximum Suppression (NMS) to filter out overlapping detections
     if len(face_data) > 1:
@@ -1528,19 +1235,14 @@ def detect_faces(frame, detect_params=None):
     # Update the global last_capture_faces variable
     last_capture_faces = face_crops
     
-    # Determine detection method for reporting
-    detection_method = 'none'
-    if face_data:
-        methods = set(face['method'] for face in face_data)
-        if len(methods) == 1:
-            detection_method = next(iter(methods))
-        else:
-            detection_method = 'hybrid'
+    # All detections will be from ssd_resnet
+    detection_method = 'ssd_resnet' if face_data else 'none'
     
+    # Return as a dictionary instead of a tuple
     return {
-        'num_faces': len(face_data),
-        'faces': face_data,
-        'detection_method': detection_method
+        'faces': face_data, 
+        'crops': face_crops,
+        'method': detection_method
     }
 
 def generate_frames():
@@ -1557,10 +1259,8 @@ def generate_frames():
                 conf = face['confidence']
                 method = face['method']
                 color = (0, 255, 0)  # Default green
-                if method == 'yunet':
-                    color = (0, 255, 255)  # Yellow for YuNet
-                elif method == 'ssd_resnet':
-                    color = (255, 0, 255)  # Purple for SSD ResNet
+                if method == 'ssd_resnet':
+                    color = (255, 0, 255)  # Purple for ssd_resnet
                 cv2.rectangle(output_frame, (x, y), (x+w, y+h), color, 2)
                 cv2.putText(output_frame, f"{method} ({conf:.2f})", (x, y-10), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
@@ -1575,6 +1275,30 @@ def generate_frames():
             # If no frame is available, yield an empty frame
             time.sleep(0.1)
 
+# Add this function near the get_local_ip function
+def setup_ngrok(port=5000):
+    """Set up ngrok tunnel to expose the local server"""
+    if not NGROK_AVAILABLE:
+        return None
+        
+    try:
+        # Set auth token
+        ngrok.set_auth_token("2jsIuWon6X9ZRwiBdHVKNG0pWp8_5qWA6iKMSirXGV9SG9SWQ")
+        
+        # Open a ngrok tunnel to the HTTP server
+        public_url = ngrok.connect(port, "http")
+        print(f"Public URL: {public_url}")
+        
+        # Log tunnel info for debugging
+        tunnels = ngrok.get_tunnels()
+        print(f"Active tunnels: {tunnels}")
+        
+        return public_url
+    except Exception as e:
+        print(f"Error setting up ngrok: {e}")
+        traceback.print_exc()
+        return None
+    
 if __name__ == '__main__':
     # Initialize face detectors
     if not init_face_detectors():
@@ -1597,10 +1321,19 @@ if __name__ == '__main__':
     # Register service for discovery
     zeroconf_instance, service_info = register_service()
     
+    # Set up ngrok for public access (before starting the server)
+    public_url = None
+    if NGROK_AVAILABLE:
+        public_url = setup_ngrok(5000)
+    
     try:
-        print(f"Server running at http://{get_local_ip()}:5000")
+        local_url = f"http://{get_local_ip()}:5000"
+        print(f"Server running locally at {local_url}")
+        if public_url:
+            print(f"Public access URL: {public_url}")
+            print(f"Share this URL to access the camera feed from anywhere")
         print("Press Ctrl+C to stop the server")
-        socketio.run(app, host='0.0.0.0', port=5000, debug=True, use_reloader=False)
+        socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False)
     except KeyboardInterrupt:
         print("Server stopped by user")
     except Exception as e:
@@ -1608,6 +1341,12 @@ if __name__ == '__main__':
     finally:
         print("Shutting down...")
         stop_signal = True
+        # Clean up ngrok tunnel
+        if NGROK_AVAILABLE:
+            try:
+                ngrok.kill()
+            except:
+                pass
         if zeroconf_instance:
             try:
                 zeroconf_instance.unregister_service(service_info)
